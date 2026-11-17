@@ -89,4 +89,4 @@ Released under the `<MIT>` License. See [`LICENSE`](LICENSE).
 
 ## Acknowledgements
 
-Built on the TIAGo model shipped with Webots and PAL Robotics' robot design. `<Add course, instructor, or collaborators if applicable.>`
+Built on the TIAGo model shipped with Webots and PAL Robotics' robot design. `<Course:Introduction to Robotics with Webots ,Instructor: Nikolaus Correll>`
