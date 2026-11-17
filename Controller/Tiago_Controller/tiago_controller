@@ -1,370 +1,552 @@
-
-"""TIAGo pick-and-carry controller for Webots.
- 
-The robot picks up three objects from the kitchen counter, carries each one
-to a drop-off spot, releases it, and loops back to the counter for the next.
-While driving it also builds a LIDAR occupancy grid and paints its own path
-on the on-screen display.
-"""
- 
-from datetime import datetime
- 
-import numpy as np
 from controller import Supervisor
- 
- 
-# ---------------------------------------------------------------------------
-# Static configuration
-# ---------------------------------------------------------------------------
-WHEEL_MAX_SPEED = 6.28          # rad/s
-ARRIVAL_RADIUS = 0.5            # metres: waypoint counts as reached inside this
-STEER_GAIN, DRIVE_GAIN = 2.8, 2.6
-SHARP_TURN_LIMIT = np.pi / 4    # beyond this heading error, slow the forward push
- 
-GRID_SHAPE = (250, 300)
-LIDAR_BEAMS = 667
-LIDAR_FOV_HALF = 2.094395       # rad
-LIDAR_TRIM = 80                 # beams ignored at each end of the scan
- 
-ARM_TIMEOUT_STEPS = 1000
-ARM_TOLERANCE = 0.005           # rad
- 
-# Joint targets the arm is commanded to when no explicit pose is given.
-HOME_POSE = {
-    "torso_lift_joint": 0.35,
-    "arm_1_joint": 0.71,
-    "arm_2_joint": 1.02,
-    "arm_3_joint": -2.815,
-    "arm_4_joint": 1.011,
-    "arm_5_joint": 0,
-    "arm_6_joint": 0,
-    "arm_7_joint": 0,
-    "gripper_left_finger_joint": 0,
-    "gripper_right_finger_joint": 0,
-    "head_1_joint": 0,
-    "head_2_joint": 0,
-}
- 
-# Pose used at the very start of the mission: arm folded up, gripper open.
-READY_POSE = {
-    "torso_lift_joint": 0.28,
-    "arm_1_joint": 1.571,
-    "arm_2_joint": 1.000,
-    "arm_4_joint": -0.262,
-    "arm_5_joint": 1.571,
-    "gripper_left_finger_joint": 0.07,
-    "gripper_right_finger_joint": 0.07,
-}
- 
-# --- Mission route data ----------------------------------------------------
-COUNTER_SPOT = (0.960, 0.500)
-CARRY_VIA = (1.025, -0.326)
- 
-# Per-round: (drop-off waypoint, final waypoint back at the counter).
-# The final spots differ per round so objects never end up stacked.
-ROUND_TARGETS = {
-    1: ((0.000, -0.700), (0.960, 0.300)),
-    2: ((0.000, -0.900), (0.960, 0.100)),
-    3: ((0.000, -1.100), (-1.727, 0.968)),
-}
- 
-# Loop around the room that leads back to the counter after a drop.
-RETURN_LOOP = [
-    (0.550, -2.500),
-    (0.550, -3.100),
-    (-0.682, -3.500),
-    (-1.550, -2.800),
-    (-1.550, -1.500),
-    (-1.550, 0.000),
-]
- 
- 
-def log(msg):
-    """Print a message prefixed with a millisecond-resolution timestamp."""
-    stamp = datetime.now().strftime("%Y%m%d %H%M%S.%f")[:-3]
-    print(f"{stamp}\t{msg}")
- 
- 
-def clamp(value, low, high):
-    return max(low, min(high, value))
- 
- 
-class TiagoMission:
-    """Wraps the Webots robot and exposes driving, arm, and mapping helpers."""
- 
+import numpy as np
+from scipy import signal
+from datetime import datetime
+from matplotlib import pyplot as plt
+
+class TiagoController:
+    """
+    High-level controller for the TIAGo robot in Webots.
+
+    This class drives the base (differential wheels) and the manipulator
+    (arm, torso and gripper), reads the onboard sensors, and builds a simple
+    LIDAR-based occupancy map while the robot moves around.
+
+    Attributes:
+        robot (Supervisor): Webots supervisor handle for the robot.
+        timestep (int): Simulation step length in ms.
+        MAX_SPEED (float): Upper limit for wheel angular velocity.
+        KP (float): Proportional gain used by the control laws.
+        KA (float): Secondary gain used by the control laws.
+        WHEEL_RADIUS (float): Wheel radius in meters.
+        AXLE_LENGTH (float): Wheel-to-wheel distance in meters.
+        robot_init_joints (dict): Default joint targets for arm, torso, gripper and head.
+        MAX_GRIP_FORCE (float): Force limit applied to the gripper.
+        motor_handles (dict): Joint name -> Webots motor device.
+        map (np.ndarray): Occupancy grid built from LIDAR hits.
+        trajectory_map (np.ndarray): Grid recording where the robot has driven.
+        kernel (np.ndarray): Kernel intended for map post-processing.
+        angles (np.ndarray): Beam angles matching each LIDAR range reading.
+    """
+
     def __init__(self):
+        """
+        Sets up the robot, registers all devices (motors, sensors, display),
+        and allocates the mapping and trajectory buffers.
+        """
+        # Create the supervisor and read the world's step size
         self.robot = Supervisor()
-        self.dt = int(self.robot.getBasicTimeStep())
- 
-        self.occupancy = np.zeros(GRID_SHAPE)
-        self.path_pixels = set()
-        self.beam_angles = np.linspace(LIDAR_FOV_HALF, -LIDAR_FOV_HALF, LIDAR_BEAMS)
- 
-        self._setup_actuators()
-        self._setup_sensors()
- 
-    # ------------------------------------------------------------------
-    # Device setup
-    # ------------------------------------------------------------------
-    def _setup_actuators(self):
-        self.joints = {name: self.robot.getDevice(name) for name in HOME_POSE}
- 
-        self.wheel_l = self.robot.getDevice("wheel_left_joint")
-        self.wheel_r = self.robot.getDevice("wheel_right_joint")
-        for wheel in (self.wheel_l, self.wheel_r):
-            wheel.setPosition(float("inf"))  # velocity-control mode
- 
-        for finger in ("gripper_left_finger_joint", "gripper_right_finger_joint"):
-            self.joints[finger].enableForceFeedback(self.dt)
- 
-    def _setup_sensors(self):
-        self.gps = self.robot.getDevice("gps")
-        self.compass = self.robot.getDevice("compass")
-        self.lidar = self.robot.getDevice("Hokuyo URG-04LX-UG01")
-        self.screen = self.robot.getDevice("display")
- 
-        for sensor in (self.gps, self.compass, self.lidar):
-            sensor.enable(self.dt)
+        self.timestep = int(self.robot.getBasicTimeStep())
+                
+        # Motion parameters
+        self.MAX_SPEED = 6.28
+        self.KP = 1.0
+        self.KA = 5.0
+        self.WHEEL_RADIUS = 0.10
+        self.AXLE_LENGTH = 0.455
+        
+        # Default joint targets (comments describe the axis each joint rotates about)
+        self.robot_init_joints = {
+            'torso_lift_joint': 0.35,            # torso height, vertical (z) axis
+            'arm_1_joint': 0.71,                 # shoulder rotation about z (lower limit 0.07 rad)
+            'arm_2_joint': 1.02,                 # shoulder rotation about x (upper limit 1.02 rad)
+            'arm_3_joint': -2.815,               # shoulder rotation about y
+            'arm_4_joint': 1.011,                # elbow bend about x
+            'arm_5_joint': 0,                    # elbow twist about z
+            'arm_6_joint': 0,                    # wrist tilt about y
+            'arm_7_joint': 0,                    # wrist roll about x
+            'gripper_left_finger_joint': 0,      # left gripper finger
+            'gripper_right_finger_joint': 0,     # right gripper finger
+            'head_1_joint': 0,                   # head pan (left/right), z axis
+            'head_2_joint': 0                    # head tilt (up/down), y axis
+        }
+                        
+        self.MAX_GRIP_FORCE = 10.0  # Gripper force cap
+        
+        # Register motors and sensors
+        self.init_devices()
+        
+        # Buffers for mapping
+        self.map = np.zeros((250, 300))
+        self.trajectory_map = np.zeros((250, 300))
+        self.kernel = np.ones((20, 20))
+        self.angles = np.linspace(2.094395, -2.094395, 667)
+
+    def init_devices(self):
+        """
+        Looks up every device the controller needs: joint motors, wheel motors,
+        GPS, compass, LIDAR and the display. Also turns on joint encoders and
+        force feedback on the gripper fingers.
+        """
+        # Joint motors (arm, torso, gripper, head)
+        self.motor_handles = {}
+        for joint_name in self.robot_init_joints.keys():
+            self.motor_handles[joint_name] = self.robot.getDevice(joint_name)
+            
+        # Wheel motors run in velocity mode (infinite target position)
+        self.leftMotor = self.robot.getDevice('wheel_left_joint')
+        self.rightMotor = self.robot.getDevice('wheel_right_joint')
+        self.leftMotor.setPosition(float('inf'))
+        self.rightMotor.setPosition(float('inf'))
+        
+        # Localization / perception devices
+        self.gps = self.robot.getDevice('gps')
+        self.compass = self.robot.getDevice('compass')
+        self.lidar = self.robot.getDevice('Hokuyo URG-04LX-UG01')
+        self.display = self.robot.getDevice('display')
+        
+        # Start the sensors
+        self.gps.enable(self.timestep)
+        self.compass.enable(self.timestep)
+        self.lidar.enable(self.timestep)
         self.lidar.enablePointCloud()
- 
-        # Visual marker that follows the waypoint currently being chased.
-        self.marker_pos = self.robot.getFromDef("marker").getField("translation")
- 
-        self.screen.setColor(0xFF0000)
- 
-        # Joint position sensors, keyed by the joint they belong to.
-        self.joint_sensors = {}
-        for name in HOME_POSE:
-            if "gripper" in name:
-                sensor_id = name.replace("finger_joint", "sensor_finger_joint")
-            else:
-                sensor_id = f"{name}_sensor"
+               
+        # Handle to the visual waypoint marker in the world
+        self.marker = self.robot.getFromDef("marker").getField("translation")
+        
+        # Initial pen color for the display
+        self.display.setColor(0xFF0000)
+
+        # Joint position sensors
+        self.encoders = {}  # start from a clean dictionary
+        for joint_name in self.robot_init_joints.keys():
             try:
-                sensor = self.robot.getDevice(sensor_id)
-                if sensor is None:
-                    print(f"Warning: Encoder '{sensor_id}' not found")
-                    continue
-                sensor.enable(self.dt)
-                self.joint_sensors[name] = sensor
-            except Exception as err:
-                print(f"Error initializing {name}: {err}")
- 
-    # ------------------------------------------------------------------
-    # Localisation and mapping
-    # ------------------------------------------------------------------
-    def _pose(self):
-        """Return (x, y, heading) of the robot in the world frame."""
-        x, y, _ = self.gps.getValues()
-        cx, cy, _ = self.compass.getValues()
-        return x, y, np.arctan2(cx, cy)
- 
-    @staticmethod
-    def world_to_grid(x, y):
-        """Map world metres to clamped (column, row) indices of the grid."""
-        col = clamp(int(52 * x + 124.8), 0, GRID_SHAPE[0] - 1)
-        row = clamp(int(-52 * y + 93.834), 0, GRID_SHAPE[1] - 1)
-        return col, row
- 
-    def _integrate_scan(self, x, y, heading):
-        """Fold the latest LIDAR sweep into the occupancy grid and display."""
-        scan = np.array(self.lidar.getRangeImage())
-        scan[np.isinf(scan)] = 100.0
- 
-        r = scan[LIDAR_TRIM:-LIDAR_TRIM]
-        a = self.beam_angles[LIDAR_TRIM:-LIDAR_TRIM]
- 
-        # Homogeneous points in the robot frame, then rotate/translate to world.
-        local = np.vstack((r * np.cos(a), r * np.sin(a), np.ones_like(a)))
-        c, s = np.cos(heading), np.sin(heading)
-        to_world = np.array([[c, -s, x],
-                             [s,  c, y],
-                             [0,  0, 1]])
-        world_pts = to_world @ local
- 
-        for wx, wy in world_pts[:2].T:
-            col, row = self.world_to_grid(wx, wy)
-            cell = min(self.occupancy[col, row] + 0.01, 1.0)
-            self.occupancy[col, row] = cell
-            grey = int(cell * 255)
-            self.screen.setColor((grey << 16) | (grey << 8) | grey)
-            self.screen.drawPixel(col, row)
- 
-    def _paint_path(self, x, y):
-        """Record the current cell and redraw the whole trail in red."""
-        self.path_pixels.add(self.world_to_grid(x, y))
-        self.screen.setColor(0xFF0000)
-        for col, row in self.path_pixels:
-            self.screen.drawPixel(col, row)
- 
-    # ------------------------------------------------------------------
-    # Driving
-    # ------------------------------------------------------------------
-    def _wheel_speeds(self, heading_err, dist):
-        """Differential-drive command from heading error and distance."""
-        if abs(heading_err) > SHARP_TURN_LIMIT:
-            turn, push = STEER_GAIN / 2, DRIVE_GAIN / 8
-        else:
-            turn, push = STEER_GAIN, DRIVE_GAIN
- 
-        left = clamp(-heading_err * turn + dist * push, -WHEEL_MAX_SPEED, WHEEL_MAX_SPEED)
-        right = clamp(heading_err * turn + dist * push, -WHEEL_MAX_SPEED, WHEEL_MAX_SPEED)
-        return left, right
- 
-    def _halt(self):
-        self.wheel_l.setVelocity(0)
-        self.wheel_r.setVelocity(0)
- 
-    def drive(self, label, waypoints):
-        """Visit each waypoint in order. Returns True once the last is reached."""
+                if 'gripper' in joint_name:
+                    # Gripper sensors follow a different naming pattern
+                    sensor_name = joint_name.replace('gripper_', 'gripper_').replace('finger_joint', 'sensor_finger_joint')
+                else:
+                    sensor_name = joint_name + '_sensor'
+                
+                encoder = self.robot.getDevice(sensor_name)
+                if encoder is not None:
+                    encoder.enable(self.timestep)
+                    self.encoders[joint_name] = encoder
+                else:
+                    print(f"Warning: Encoder '{sensor_name}' not found")
+            except Exception as e:
+                print(f"Error initializing {joint_name}: {e}")
+
+        # Gripper force readings
+        self.motor_handles['gripper_left_finger_joint'].enableForceFeedback(self.timestep)
+        self.motor_handles['gripper_right_finger_joint'].enableForceFeedback(self.timestep)
+
+    def control_wheel(self, action=None, waypoints=None):
+        """
+        Drives the base through a list of waypoints, one after another.
+
+        Args:
+            action (str, optional): Label used in log output.
+            waypoints (list of tuples, optional): (x, y) targets in world coordinates.
+
+        Raises:
+            ValueError: If the waypoint list is empty or missing.
+            RuntimeError: If anything goes wrong while driving.
+
+        Returns:
+            bool: True once the last waypoint is reached.
+        """
         if not waypoints:
             raise ValueError("No waypoints provided")
- 
+        
         try:
-            target_idx = 0
-            while self.robot.step(self.dt) != -1:
-                x, y, heading = self._pose()
-                tx, ty = waypoints[target_idx]
- 
-                self.marker_pos.setSFVec3f([tx, ty, 0])
- 
-                dist = np.hypot(tx - x, ty - y)
-                heading_err = np.arctan2(ty - y, tx - x) - heading
-                if heading_err > np.pi:
-                    heading_err -= 2 * np.pi
-                elif heading_err < -np.pi:
-                    heading_err += 2 * np.pi
- 
-                left, right = self._wheel_speeds(heading_err, dist)
- 
-                if dist < ARRIVAL_RADIUS:
-                    log(f"  > Reached waypoint '{target_idx}', position: {waypoints[target_idx]}")
-                    target_idx += 1
-                    if target_idx == len(waypoints):
-                        self._halt()
-                        log(f"Wheel action '{label}' completed")
+            index = 0
+            while self.robot.step(self.timestep) != -1:
+                # Read pose from GPS and compass
+                gps_values = self.gps.getValues()
+                compass_values = self.compass.getValues()
+                xw, yw = gps_values[0], gps_values[1]
+                theta = np.arctan2(compass_values[0], compass_values[1])
+                
+                # Move the visual marker onto the current target
+                self.marker.setSFVec3f([*waypoints[index], 0])
+                
+                # Distance (rho) and heading error (alpha) to the target
+                rho = np.sqrt((xw - waypoints[index][0])**2 + 
+                             (yw - waypoints[index][1])**2)
+                alpha = np.arctan2(waypoints[index][1] - yw, 
+                                 waypoints[index][0] - xw) - theta
+                
+                # Wrap the heading error into [-pi, pi]
+                if alpha > np.pi: alpha -= 2 * np.pi
+                elif alpha < -np.pi: alpha += 2 * np.pi
+                
+                # Convert the errors into wheel speeds
+                left_speed, right_speed = self.calculate_motor_speeds(alpha, rho)
+                
+                # Close enough? Advance to the next waypoint (or finish)
+                if rho < 0.5:
+                    self.print_debug(f"  > Reached waypoint '{index}', position: {waypoints[index]}")
+                    index += 1
+                    if index == len(waypoints):
+                        self.leftMotor.setVelocity(0)
+                        self.rightMotor.setVelocity(0)
+                        self.print_debug(f"Wheel action '{action}' completed")
                         return True
- 
-                self.wheel_l.setVelocity(left)
-                self.wheel_r.setVelocity(right)
- 
-                self._integrate_scan(x, y, heading)
-                self._paint_path(x, y)
- 
-        except Exception as err:
-            self._halt()
-            raise RuntimeError(f"Wheel control failed during '{label}': {err}")
- 
-    # ------------------------------------------------------------------
-    # Arm
-    # ------------------------------------------------------------------
-    def move_arm(self, label, pose=None, tolerance=ARM_TOLERANCE):
-        """Command a joint pose and block until every joint is within tolerance."""
-        pose = pose or HOME_POSE
- 
+                
+                # Apply the wheel speeds
+                self.leftMotor.setVelocity(left_speed)
+                self.rightMotor.setVelocity(right_speed)
+                
+                # Fold the latest LIDAR scan into the map
+                self.update_mapping(xw, yw, theta)
+                
+                # Mark the robot's current cell and redraw the path on the display
+                px, py = self.world2map(xw, yw)
+                self.trajectory_map[px, py] = 1.0
+                self.display.setColor(0xFF0000)
+                for i in range(250):
+                    for j in range(300):
+                        if self.trajectory_map[i, j] > 0:
+                            self.display.drawPixel(i, j)
+        
+        except Exception as e:
+            # Halt the base if something fails
+            self.leftMotor.setVelocity(0)
+            self.rightMotor.setVelocity(0)
+            raise RuntimeError(f"Wheel control failed during '{action}': {str(e)}")
+
+    def control_arm(self, action=None, positions=None, tolerance=0.005):
+        """
+        Commands a set of joints to target angles and blocks until they get
+        there (within tolerance) or the step budget runs out.
+
+        Args:
+            action (str, optional): Label used in log output.
+            positions (dict, optional): Joint name -> target angle (rad). Defaults to the home pose.
+            tolerance (float, optional): Allowed joint error in radians.
+
+        Raises:
+            ValueError: If a joint name is not recognized.
+            RuntimeError: If the move fails or takes too long.
+
+        Returns:
+            bool: True when every joint has reached its target.
+        """
+        if not positions:
+            positions = self.robot_init_joints
+        
         try:
-            for name, goal in pose.items():
-                if name not in self.joints:
-                    raise ValueError(f"Invalid joint name: {name}")
-                self.joints[name].setPosition(goal)
- 
-            steps_taken = 0
-            while self.robot.step(self.dt) != -1:
-                steps_taken += 1
-                if steps_taken > ARM_TIMEOUT_STEPS:
+            # Check each joint name and send its target
+            for joint_name, target_position in positions.items():
+                if joint_name not in self.motor_handles:
+                    raise ValueError(f"Invalid joint name: {joint_name}")
+                self.motor_handles[joint_name].setPosition(target_position)
+
+            # Step the simulation until all joints settle
+            timeout_steps = 1000  # safety limit against endless loops
+            steps = 0
+            
+            while self.robot.step(self.timestep) != -1:
+                steps += 1
+                if steps > timeout_steps:
                     raise RuntimeError("Movement timeout exceeded")
- 
-                settled = all(
-                    abs(self.joint_sensors[name].getValue() - goal) <= tolerance
-                    for name, goal in pose.items()
-                    if name in self.joint_sensors
-                )
-                if settled:
-                    log(f"Arm action '{label}' completed")
+                
+                all_reached = True
+                for joint_name, target_position in positions.items():
+                    if joint_name in self.encoders:
+                        current_pos = self.encoders[joint_name].getValue()
+                        if abs(current_pos - target_position) > tolerance:
+                            all_reached = False
+                            break
+                
+                if all_reached:
+                    self.print_debug(f"Arm action '{action}' completed")
                     return True
- 
-        except Exception as err:
-            raise RuntimeError(f"Arm control failed during '{label}': {err}")
- 
-    def pause(self, ms):
-        """Let the simulation run for roughly `ms` milliseconds."""
-        for _ in range(int(ms / self.dt)):
-            self.robot.step(self.dt)
- 
-    def pick_up(self, n):
-        """Reach out, close the gripper, and raise the object."""
+                
+        except Exception as e:
+            raise RuntimeError(f"Arm control failed during '{action}': {str(e)}")
+
+    def world2map(self, xw, yw):
+        """
+        Maps a world-frame point to a cell in the occupancy grid.
+
+        Args:
+            xw (float): World X coordinate.
+            yw (float): World Y coordinate.
+
+        Returns:
+            list: [px, py] grid indices, limited to the grid's bounds.
+        """
+        px = int(52 * xw + 124.8)
+        py = int(-52 * yw + 93.834)
+        px = max(min(px, 249), 0)
+        py = max(min(py, 299), 0)
+        return [px, py]
+
+    def calculate_motor_speeds(self, alpha, rho):
+        """
+        Turns heading and distance errors into left/right wheel speeds.
+        When the heading error is large, the robot mostly rotates in place.
+
+        Args:
+            alpha (float): Heading error in radians.
+            rho (float): Distance to target in meters.
+
+        Returns:
+            tuple: (left_speed, right_speed) in rad/s, limited to +/-MAX_SPEED.
+        """
+        p1, p2 = 2.8, 2.6
+        if abs(alpha) > np.pi/4:
+            leftSpeed = -alpha * p1 / 2 + rho * p2 / 8
+            rightSpeed = alpha * p1 / 2 + rho * p2 / 8
+        else:
+            leftSpeed = -alpha * p1 + rho * p2
+            rightSpeed = alpha * p1 + rho * p2
+            
+        # Saturate to the speed limit
+        leftSpeed = max(min(leftSpeed, self.MAX_SPEED), -self.MAX_SPEED)
+        rightSpeed = max(min(rightSpeed, self.MAX_SPEED), -self.MAX_SPEED)
+        return leftSpeed, rightSpeed
+
+    def update_mapping(self, xw, yw, theta):
+        """
+        Projects the current LIDAR scan into the world frame and raises the
+        occupancy value of every cell that was hit.
+
+        Args:
+            xw (float): Robot X in the world frame.
+            yw (float): Robot Y in the world frame.
+            theta (float): Robot heading in radians.
+        """
+        ranges = np.array(self.lidar.getRangeImage())
+        ranges[ranges == np.inf] = 100  # stand-in value for "no return"
+        
+        # Drop the outermost beams on both sides
+        valid_ranges = ranges[80:-80]
+        valid_angles = self.angles[80:-80]
+        
+        # Polar -> Cartesian in the robot's own frame (homogeneous coordinates)
+        X_r = np.array([
+            (valid_ranges * np.cos(valid_angles)),
+            (valid_ranges * np.sin(valid_angles)),
+            np.ones(len(valid_angles))
+        ])
+        
+        # Rigid transform: robot frame -> world frame
+        w_T_r = np.array([
+            [np.cos(theta), -np.sin(theta), xw],
+            [np.sin(theta), np.cos(theta), yw],
+            [0, 0, 1]
+        ])
+        D = w_T_r @ X_r
+        
+        # Raise occupancy for each hit cell and paint it in grayscale
+        for i in range(D.shape[1]):
+            px, py = self.world2map(D[0, i], D[1, i])
+            self.map[px, py] = min(self.map[px, py] + 0.01, 1.0)
+            color_byte = int(self.map[px, py] * 255)
+            color = (color_byte << 16) | (color_byte << 8) | color_byte
+            self.display.setColor(color)
+            self.display.drawPixel(px, py)
+
+    def grab_object(self, action_id):
+        """
+        Picks up an object: reach out, close the fingers, then raise the arm.
+
+        Args:
+            action_id (int): Index of this pick, used in log labels.
+
+        Raises:
+            RuntimeError: If any stage of the pick fails.
+
+        Returns:
+            bool: True if the whole sequence finishes.
+        """
         try:
-            stages = [
-                (f"grab-{n}a", {"arm_2_joint": 0, "arm_4_joint": 0, "arm_5_joint": 1.571},
-                 "Failed to position arm horizontally"),
-                (f"grab-{n}b", {"gripper_left_finger_joint": 0.04,
-                                "gripper_right_finger_joint": 0.04},
-                 "Failed to close gripper"),
-                (f"grab-{n}c", {"arm_2_joint": 1.000, "arm_4_joint": -0.262,
-                                "arm_5_joint": 1.571},
-                 "Failed to lift arm"),
-            ]
-            for label, pose, failure in stages:
-                if not self.move_arm(label, pose):
-                    raise RuntimeError(failure)
-                self.pause(300)
+            # Stage 1: extend the arm out horizontally
+            if not self.control_arm(f"grab-{action_id}a", {
+                'arm_2_joint': 0,
+                'arm_4_joint': 0,
+                'arm_5_joint': 1.571,
+            }):
+                raise RuntimeError("Failed to position arm horizontally")
+                
+            self.wait_for_milliseconds(300)
+            
+            # Stage 2: close the fingers around the object
+            if not self.control_arm(f"grab-{action_id}b", {
+                'gripper_left_finger_joint': 0.04,
+                'gripper_right_finger_joint': 0.04,
+            }):
+                raise RuntimeError("Failed to close gripper")
+                
+            self.wait_for_milliseconds(300)
+            
+            # Stage 3: raise the arm while holding the object
+            if not self.control_arm(f"grab-{action_id}c", {
+                'arm_2_joint': 1.000,
+                'arm_4_joint': -0.262,
+                'arm_5_joint': 1.571,
+            }):
+                raise RuntimeError("Failed to lift arm")
+                
+            self.wait_for_milliseconds(300)
             return True
-        except Exception as err:
-            raise RuntimeError(f"Grab object sequence {n} failed: {err}")
- 
-    def put_down(self, n):
-        """Lower the torso, open the gripper, then bring everything back up."""
+            
+        except Exception as e:
+            raise RuntimeError(f"Grab object sequence {action_id} failed: {str(e)}")
+
+    def drop_object(self, action_id):
+        """
+        Releases the held object: lower the torso, open the fingers, then
+        bring the arm back up.
+
+        Args:
+            action_id (int): Index of this drop, used in log labels.
+
+        Raises:
+            RuntimeError: If any stage of the drop fails.
+
+        Returns:
+            bool: True if the whole sequence finishes.
+        """
         try:
-            stages = [
-                (f"drop-{n}d", {"torso_lift_joint": 0.10, "arm_2_joint": 0,
-                                "arm_6_joint": -0.524},
-                 "Failed to position arm for drop"),
-                (f"drop-{n}b", {"gripper_left_finger_joint": 0.07,
-                                "gripper_right_finger_joint": 0.07},
-                 "Failed to open gripper"),
-                (f"drop-{n}c", {"torso_lift_joint": 0.28, "arm_2_joint": 1.000,
-                                "arm_6_joint": 0},
-                 "Failed to return to upright position"),
-            ]
-            for label, pose, failure in stages:
-                if not self.move_arm(label, pose):
-                    raise RuntimeError(failure)
-                self.pause(300)
+            # Stage 1: lower the torso and tilt the wrist toward the drop spot
+            if not self.control_arm(f"drop-{action_id}d", {
+                'torso_lift_joint': 0.10,
+                'arm_2_joint': 0,
+                'arm_6_joint': -0.524,
+            }):
+                raise RuntimeError("Failed to position arm for drop")
+                
+            self.wait_for_milliseconds(300)
+            
+            # Stage 2: open the fingers to let go
+            if not self.control_arm(f"drop-{action_id}b", {
+                'gripper_left_finger_joint': 0.07,
+                'gripper_right_finger_joint': 0.07,
+            }):
+                raise RuntimeError("Failed to open gripper")
+                
+            self.wait_for_milliseconds(300)
+            
+            # Stage 3: raise the torso and arm back to the carrying pose
+            if not self.control_arm(f"drop-{action_id}c", {
+                'torso_lift_joint': 0.28,
+                'arm_2_joint': 1.000,
+                'arm_6_joint': 0,
+            }):
+                raise RuntimeError("Failed to return to upright position")
+                
+            self.wait_for_milliseconds(300)
             return True
-        except Exception as err:
-            raise RuntimeError(f"Drop object sequence {n} failed: {err}")
- 
-    # ------------------------------------------------------------------
-    # Mission
-    # ------------------------------------------------------------------
+            
+        except Exception as e:
+            raise RuntimeError(f"Drop object sequence {action_id} failed: {str(e)}")
+
+    def wait_for_milliseconds(self, milliseconds):
+        """
+        Idles for the given time by stepping the simulation.
+
+        Args:
+            milliseconds (int): How long to wait, in ms.
+        """
+        loop = int(milliseconds / self.timestep)
+        for _ in range(loop):
+            self.robot.step(self.timestep)
+
+    def print_debug(self, message):
+        """
+        Prints a message prefixed with a millisecond-resolution timestamp.
+
+        Args:
+            message (str): Text to print.
+        """
+        # Timestamp trimmed from microseconds to milliseconds
+        formatted_time = datetime.now().strftime('%Y%m%d %H%M%S.%f')[:-3]
+        print(f"{formatted_time}\t{message}")
+
     def run(self):
-        """Execute the full three-object transfer. Returns True on success."""
+        """
+        Main mission routine: put the arm in its carrying pose, drive to the
+        pickup area, then repeat grab -> deliver -> drop -> return three times.
+
+        Raises:
+            RuntimeError: If a step in the mission fails (caught internally).
+
+        Returns:
+            bool: True if the mission finishes, False if it aborts.
+        """
         try:
-            if not self.move_arm("arm-initial", READY_POSE):
+            # -----------------------------------------------------------------------
+            # Startup: carrying pose and first approach
+            # -----------------------------------------------------------------------
+            if not self.control_arm('arm-initial', {
+                'torso_lift_joint': 0.28,
+                'arm_1_joint': 1.571,
+                'arm_2_joint': 1.000,
+                'arm_4_joint': -0.262,
+                'arm_5_joint': 1.571,
+                'gripper_left_finger_joint': 0.07,
+                'gripper_right_finger_joint': 0.07,
+            }):
                 raise RuntimeError("Failed to set initial arm position")
-            if not self.drive("navigation-initial", [COUNTER_SPOT]):
+
+            if not self.control_wheel('navigation-initial', [(0.960, 0.500)]):
                 raise RuntimeError("Failed initial navigation")
- 
-            for n, (drop_spot, counter_spot) in ROUND_TARGETS.items():
-                if not self.pick_up(n):
-                    raise RuntimeError(f"Failed to grab object in round {n}")
- 
-                if not self.drive(f"navigation-{n}a", [CARRY_VIA, drop_spot]):
-                    raise RuntimeError(f"Failed navigation {n}a")
- 
-                if not self.put_down(n):
-                    raise RuntimeError(f"Failed to drop object in round {n}")
- 
-                if not self.drive(f"navigation-{n}b", RETURN_LOOP + [counter_spot]):
-                    raise RuntimeError(f"Failed navigation {n}b")
- 
-            log("Mission completed successfully")
+
+            # Per-round offsets so the objects at the kitchen end up in different spots
+            finetune_waypoints = {
+                1: [
+                    ( 0.000, -0.700),
+                    ( 0.960,  0.300)
+                ],
+                2: [
+                    ( 0.000, -0.900),
+                    ( 0.960,  0.100),
+                ],
+                3: [
+                    ( 0.000, -1.100),
+                    (-1.727,  0.968),
+                ],
+            }
+            
+            # -----------------------------------------------------------------------
+            # Three rounds: pick up, carry over, drop off, drive back
+            # -----------------------------------------------------------------------
+            for round_num in range(1, 4):
+                # Pick up the object
+                if not self.grab_object(round_num):
+                    raise RuntimeError(f"Failed to grab object in round {round_num}")
+                
+                # Carry it to the drop-off point
+                if not self.control_wheel(f'navigation-{round_num}a', [
+                    (1.025, -0.326),
+                    finetune_waypoints[round_num][0]
+                ]):
+                    raise RuntimeError(f"Failed navigation {round_num}a")
+                
+                # Put it down
+                if not self.drop_object(round_num):
+                    raise RuntimeError(f"Failed to drop object in round {round_num}")
+                
+                # Loop around the room back to the pickup area
+                if not self.control_wheel(f'navigation-{round_num}b', [
+                    ( 0.550, -2.500),  # right side
+                    ( 0.550, -3.100),  # lower right
+                    (-0.682, -3.500),  # bottom
+                    (-1.550, -2.800),  # lower left
+                    (-1.550, -1.500),  # left side
+                    (-1.550, -0.000),  # upper left
+                    finetune_waypoints[round_num][1]
+                ]):
+                    raise RuntimeError(f"Failed navigation {round_num}b")
+
+            self.print_debug("Mission completed successfully")
             return True
- 
-        except Exception as err:
-            log(f"Mission failed: {err}")
-            self._halt()
+
+        except Exception as e:
+            self.print_debug(f"Mission failed: {str(e)}")
+            # Stop the base before giving up
+            self.leftMotor.setVelocity(0)
+            self.rightMotor.setVelocity(0)
             return False
- 
- 
+
+
 if __name__ == "__main__":
-    TiagoMission().run()
+    """
+    Script entry point: build the controller and run the mission.
+    """
+    # Instantiate and start
+    controller = TiagoController()
+    controller.run()
