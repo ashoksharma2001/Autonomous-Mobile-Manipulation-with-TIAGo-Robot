@@ -1,0 +1,4 @@
+# Python packages (the `controller` module comes with Webots, not pip)
+numpy
+scipy        # used by the original script for convolution-based map processing
+matplotlib   # used by the original script for plotting the processed map
