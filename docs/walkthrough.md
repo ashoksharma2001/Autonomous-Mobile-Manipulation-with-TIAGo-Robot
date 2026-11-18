@@ -17,8 +17,7 @@ This document explains how [`tiago_controller.py`](../controllers/tiago_controll
 9. [Moving the arm](#9-moving-the-arm)
 10. [Picking up and putting down](#10-picking-up-and-putting-down)
 11. [The mission](#11-the-mission)
-12. [Limitations and ideas for extension](#12-limitations-and-ideas-for-extension)
-13. [Summary](#13-summary)
+12. [Summary](#13-summary)
 
 ---
 
