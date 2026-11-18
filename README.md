@@ -10,7 +10,7 @@ A Webots controller that has a simulated PAL Robotics TIAGo fetch three objects 
 | | |
 |---|---|
 | **Task** | Three-round pick, carry, place, and return in a kitchen scene |
-| **Platform** | Webots `<version, e.g. R2023b>`, Python `<3.x>` |
+| **Platform** | Webots `<R2023b>`, Python `<3.10>` |
 | **Robot** | TIAGo (differential-drive base, 7-DoF arm, parallel gripper) |
 | **Sensing** | GPS, compass, 2D lidar (Hokuyo URG-04LX) |
 | **Navigation** | Waypoint following with a proportional heading/distance controller |
@@ -19,12 +19,12 @@ A Webots controller that has a simulated PAL Robotics TIAGo fetch three objects 
 ## Quick start
 
 ```bash
-git clone https://github.com/<your-username>/<repo-name>.git
-cd <repo-name>
+git clone https://github.com/ashoksharma2001/tiago-pick-and-carry.git
+cd <tiago-pick-and-carry>
 pip install -r requirements.txt
 ```
 
-1. Open `worlds/<your_world>.wbt` in Webots.
+1. Open `worlds/world.wbt` in Webots.
 2. Make sure the robot's `controller` field is set to `tiago_controller`.
 3. Press play. The log prints timestamped progress, ending with `Mission completed successfully`.
 
@@ -54,15 +54,6 @@ pip install -r requirements.txt
 
 A detailed walkthrough is in [`docs/walkthrough.md`](docs/walkthrough.md).
 
-## Results
-
-<!-- Fill in with your own numbers. Labs like measurements more than adjectives. -->
-
-| Metric | Value |
-|---|---|
-| Rounds completed (n runs) | `<x / n>` |
-| Mean mission time (sim seconds) | `<…>` |
-| Failure cases observed | `<e.g. object slips during carry>` |
 
 ## Limitations
 
@@ -80,8 +71,8 @@ A detailed walkthrough is in [`docs/walkthrough.md`](docs/walkthrough.md).
 
 ## Requirements
 
-- [Webots](https://cyberbotics.com/) `<version>`
-- Python `<3.x>` and the packages in `requirements.txt`
+- [Webots](https://cyberbotics.com/) `<R2023b>`
+- Python `<3.11>` and the packages in `requirements.txt`
 
 ## License
 
