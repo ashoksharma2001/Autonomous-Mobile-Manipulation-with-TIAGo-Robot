@@ -152,14 +152,8 @@ The return spots and drop-off spots differ for each round on purpose, so the obj
 
 The file ends with a standard `__main__` guard that builds a `TiagoMission` and calls `run`.
 
-## 12. Limitations and ideas for extension
 
-- **No obstacle avoidance.** The route is fixed. A local planner using the lidar, or a planner such as A* or RRT on the occupancy grid, would let the robot cope with unexpected obstacles.
-- **Simple proportional steering.** Adding derivative or integral terms, or a smoother path through the waypoints, would reduce overshoot and jerky turns.
-- **Perception limited to GPS and compass.** Fusing wheel odometry or an IMU with a Kalman filter would be closer to what a real robot needs, since GPS is a simulation convenience.
-- **Open-loop grasping.** Objects are grabbed at hard-coded poses. Using the gripper force feedback or a camera to confirm a grasp would make it robust to position errors.
-- **Map is only for display.** The occupancy grid is never used for decisions; thresholding or inflating it would be the first step toward planning with it.
 
-## 13. Summary
+## 12. Summary
 
 The controller is small but covers the main parts of a mobile manipulation stack: sensing, a proportional navigation loop, scripted arm behaviour with verification and timeouts, and a lightweight mapping layer, all with defensive error handling that stops the robot safely when something goes wrong. Because the routes and poses are data rather than code, adapting it to a new scene mostly means editing the tables at the top of the file.
