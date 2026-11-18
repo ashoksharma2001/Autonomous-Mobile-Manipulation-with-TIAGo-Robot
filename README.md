@@ -18,8 +18,8 @@ A Webots controller that has a simulated PAL Robotics TIAGo fetch three objects 
 ## Quick start
 
 ```bash
-git clone https://github.com/ashoksharma2001/tiago-pick-and-carry.git
-cd <tiago-pick-and-carry>
+git clone https://github.com/ashoksharma2001/Autonomous-Mobile-Manipulation-with-TIAGo-Robot.git
+cd <Autonomous-Mobile-Manipulation-with-TIAGo-Robot>
 pip install -r requirements.txt
 ```
 
