@@ -2,8 +2,7 @@
 
 A Webots controller that has a simulated PAL Robotics TIAGo fetch three objects from a kitchen counter, carry each to a drop-off point, and return for the next, while building a lidar occupancy grid and drawing its own path on the on-screen display.
 
-<!-- TODO: replace with a real GIF or screenshot of your run (a 10-20 s screen recording of the Webots window works best) -->
-![Demo](docs/media/demo.gif)
+![Demo](docs/final_project_gif.gif)
 
 ## Overview
 
@@ -55,19 +54,7 @@ pip install -r requirements.txt
 A detailed walkthrough is in [`docs/walkthrough.md`](docs/walkthrough.md).
 
 
-## Limitations
 
-- Localization uses simulator GPS and compass, which are privileged sensors with no noise model.
-- The route is fixed and open-loop; there is no obstacle avoidance or replanning.
-- Grasp poses are hard-coded. The gripper force feedback is enabled but not used to confirm a grasp.
-- The occupancy grid is for visualization only and is not used for decisions.
-
-## Possible extensions
-
-- Replace GPS/compass with lidar-based localization (e.g. scan matching or AMCL-style filtering).
-- Plan on the occupancy grid (A\*, RRT\*) and add reactive obstacle avoidance.
-- Use a camera and a learned or geometric grasp detector in place of fixed poses.
-- Close the loop on grasp success using gripper force and finger position.
 
 ## Requirements
 
